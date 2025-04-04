@@ -11,16 +11,16 @@ class Case(Base):
     voice_no = Column("kjoinfo_tsuban", String, primary_key=True)
     classification_code = Column(
         "mshd_daibunric", String, ForeignKey("tblimdnai.mshd_daibunric")
-    )
+        )
     category_code = Column(
         "mosd_chbnrui_c", String, ForeignKey("tblimdnai.mosd_chbnrui_c")
-    )
+        )
     subcategory_code = Column(
         "mosd_shbnrui_c", String, ForeignKey("tblimdnai.mosd_shbnrui_c")
-    )
+        )
     subsubcategory_code = Column(
         "mosd_saibnruic", String, ForeignKey("tblimdnai.mosd_saibnruic")
-    )
+        )
 
 
 class LabelMaster(Base):

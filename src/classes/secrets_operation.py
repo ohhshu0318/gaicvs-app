@@ -1,19 +1,21 @@
 import json
+from logging import getLogger
 
 import boto3
 
-from classes.logging import logger
+# Logging configuration
+logger = getLogger(__name__)
 
 
-class SecretsOperation:
+class SecretsOperation():
     def __init__(self, secret_id) -> None:
         self.secret_id = secret_id
         logger.debug(f"Secretsoperation input value:{secret_id}")
         self.sm_client = boto3.client("secretsmanager")
         try:
-            self.secrets = self.sm_client.get_secret_value(SecretId=secret_id)[
-                "SecretString"
-            ]
+            self.secrets = self.sm_client.get_secret_value(
+                SecretId=secret_id
+                )["SecretString"]
             logger.debug(f"self.secrets:{self.secrets}")
         except Exception as e:
             raise RuntimeError(

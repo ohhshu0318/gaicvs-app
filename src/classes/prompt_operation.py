@@ -15,12 +15,8 @@ class s3_prompt_manager:
             logging.info(f"プロンプト取得した:{self.bucket_name}{prompt_key}")
             return response
         except Exception as e:
-            logging.error(
-                f"プロンプト取得失敗:{self.bucket_name}{prompt_key}{str(e)}"
-            )
-            raise RuntimeError(
-                f"プロンプト取得失敗 '{prompt_key}': {str(e)}"
-            ) from e
+            logging.error(f"プロンプト取得失敗:{self.bucket_name}{prompt_key}{str(e)}")
+            raise RuntimeError(f"プロンプト取得失敗 '{prompt_key}': {str(e)}") from e
 
 
 s3_prompt = s3_prompt_manager(PROMPTS_BUCKET_NAME)

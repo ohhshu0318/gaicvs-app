@@ -1,53 +1,27 @@
-"""要約タスク実行モジュール。
-Summarization task execution module.
-
-このモジュールは、生命保険会社の苦情要望データの要約処理を行います。
-This module performs summarization processing of life insurance company complaint data.
-
-処理の流れ (Processing flow):
-1. 入力CSVの取得と検証 (Get and validate input CSV)
-2. テキストデータのクリーニング (Clean text data)
-3. テキストの結合とプロンプト生成 (Combine text and generate prompts)
-4. Florence APIによる要約生成 (Generate summaries using Florence API)
-5. 結果のS3保存とDB書き込み (Save results to S3 and write to DB)
-"""
-
 import argparse
-import os
+import asyncio
 from datetime import datetime, timezone
-from typing import Dict, List, Any, Tuple, Optional
+from io import StringIO
 
 import pandas as pd
-from sqlalchemy import MetaData, Table
-from sqlalchemy.exc import OperationalError
-
 from classes.db_operation import db_operator
-from classes.error_handle import CustomError, error_context, error_handler, safe_execute
+from classes.error_handler import error_handler
 from classes.florence_operation import florence_operator
-from classes.logging import s3_logger
+from classes.logging_handler import application_logger
 from classes.prompt_operation import s3_prompt
 from classes.storage_operation import storage_operator
-from common.const import (
-    S3_ENDFILE_PATH,
-    S3_INPUT_PATH,
-    S3_LOG_PATH,
-    S3_SUMMARIZATION_RESULTS_PATH,
-    SUMMARIZATION_PROMPT_PATH,
-    SUMMARIZATION_RESULST_CSV_HEADER,
-)
-from common.utils import from_utc_to_jst
+from common.const import (S3_ENDFILE_PATH, S3_INPUT_PATH, S3_LOG_PATH,
+                          S3_SUMMARIZATION_RESULTS_PATH,
+                          SUMMARIZATION_PROMPT_PATH,
+                          SUMMARIZATION_RESULTS_CSV_HEADER)
+from sqlalchemy import MetaData, Table
 from utils.data_utils import DataUtils
+from utils.jst_utils import from_utc_to_jst
 from utils.prompt_utils import PromptUtils
 from utils.s3_utils import S3Utils
 
 
-def init_args() -> argparse.Namespace:
-    """コマンドライン引数を初期化する。
-    Initialize command line arguments.
-
-    Returns:
-        解析されたコマンドライン引数 / Parsed command line arguments
-    """
+def init_args():
     parser = argparse.ArgumentParser(description="要約タスクを実行する")
 
     parser.add_argument(
@@ -55,7 +29,7 @@ def init_args() -> argparse.Namespace:
         type=str,
         dest="run_date",
         required=True,
-        help="タスク実行日 / Task execution date",
+        help="タスク実行日",
     )
     parser.add_argument(
         "--execution_id",
@@ -64,163 +38,171 @@ def init_args() -> argparse.Namespace:
         required=True,
         help="Step Function execution ID",
     )
-    
-    return parser.parse_args()
+    args = parser.parse_args()
+
+    return args
 
 
-@error_handler(
-    "logs/summarization.log", "ERR", "02", "1", "001", "001"
-)
-def read_csv_from_s3(input_s3_key: str) -> pd.DataFrame:
-    """S3からCSVファイルを読み込む。
-    Read CSV file from S3.
-
-    Args:
-        input_s3_key: 入力ファイルのS3キー / S3 key of input file
-
-    Returns:
-        読み込んだDataFrame / Loaded DataFrame
+def generate_s3_path(
+    base_path: str, run_date: str, execution_id: str, type: str = ""
+) -> str:
     """
-    s3_logger.info(f"{input_s3_key} からCSVデータを取得します")
-    s3_logger.info(f"Getting CSV data from {input_s3_key}")
-    
-    csv_data = storage_operator.get_object(input_s3_key)
-    df = pd.read_csv(csv_data)
-    
-    if df.empty:
-        s3_logger.error("入力CSVファイルにデータがありません")
-        s3_logger.error("Input CSV file contains no data")
-        raise ValueError("Input CSV file is empty")
-    
-    return df
-
-
-@error_handler(
-    "logs/summarization.log", "ERR", "02", "1", "004", "003"
-)
-def generate_summaries(df: pd.DataFrame, prompt_template: str) -> pd.DataFrame:
-    """テキストの要約を生成する。
-    Generate summaries of texts.
-
-    Args:
-        df: 入力データフレーム / Input DataFrame
-        prompt_template: プロンプトテンプレート / Prompt template
-
-    Returns:
-        要約結果を含むDataFrame / DataFrame with summary results
+    生成S3パス。typeが指定されていない場合、無視する。
     """
-    # テキストカラムの結合 / Combine text columns
-    df["combined_text"] = DataUtils.combine_text_columns(
-        df, ["mosd_naiyou", "taioushousai", "kujo_partybiko"]
+    if type:
+        return (
+            base_path.replace("@run_date", run_date)
+            .replace("@execution_id", execution_id)
+            .replace("@type", type)
+        )
+    else:
+        return base_path.replace("@run_date", run_date).replace(
+            "@execution_id", execution_id
+        )
+
+
+@error_handler("summarization", "read_csv")
+def read_csv_from_s3(
+    run_date: str, execution_id: str, type: str, log_path: str
+):
+    """
+    S3からCSVデータを読み込む
+    """
+    input_file_name = generate_s3_path(
+        S3_INPUT_PATH, run_date, execution_id, type
     )
 
-    s3_logger.info("行の結合処理が正常に完了しました")
-    s3_logger.info("Row combination processing completed successfully")
+    csv_data = storage_operator.get_object(input_file_name)
+    df = pd.read_csv(StringIO(csv_data))
 
-    # プロンプト生成 / Generate prompts
-    df = PromptUtils.generate_summarization_prompt(
-        df, prompt_template, "combined_text"
+    if df.empty:
+        application_logger.error(f"CSVデータが空です: {input_file_name}")
+        raise ValueError("CSVデータが空です")
+
+    application_logger.info(f"{input_file_name} からCSVデータを取得しました")
+
+    # DataUtilsを使用してデータをクリーニング
+    df_cleaned, missing_rows = DataUtils.clean_text_data(
+        df, columns=["mosd_naiyou", "taioushousai"]
+    )
+
+    if not missing_rows.empty:
+        application_logger.info(
+            f"欠損値や空の値を含む行が {len(missing_rows)}件 削除されました"
+        )
+
+    return df_cleaned
+
+
+@error_handler("summarization", "generate_summaries")
+def summarization(df, summarization_prompt, log_path):
+    """
+    特定の列を結合し、Promptを生成してAPIで要約を取得する
+    """
+    # テキスト列を結合
+    df["combined_text"] = DataUtils.combine_text_columns(
+        df, ["mosd_naiyou", "taioushousai"]
+    )
+
+    application_logger.info("行の結合処理が正常に完了しました")
+
+    # PromptUtilsを使用してプロンプトを生成
+    df = PromptUtils.create_summary_prompt(
+        df, summarization_prompt, "combined_text"
+    )
+
+    # 不要な列を削除
+    df.drop(
+        columns=["mosd_naiyou", "taioushousai", "combined_text"], inplace=True
     )
 
     input_prompts = df["genai_summary_prompt"].tolist()
-    s3_logger.info(f"{len(input_prompts)} 件のプロンプトを生成しました")
-    s3_logger.info(f"Generated {len(input_prompts)} prompts")
-    
-    # Florence APIにリクエスト / Request to Florence API
-    s3_logger.info("Florence APIに要約リクエストを送信します")
-    s3_logger.info("Sending summarization request to Florence API")
-    
-    summary_result = florence_operator.chat(input_prompts)
-    
-    s3_logger.info("APIから要約を取得しました")
-    s3_logger.info("Retrieved summaries from API")
+    application_logger.info(f"生成したプロンプト: {input_prompts}")
 
-    # レスポンス処理 / Process responses
-    results = PromptUtils.extract_api_responses(
+    # APIで要約を取得
+    summary_result = asyncio.run(florence_operator.chat(input_prompts))
+    application_logger.info(f"要約結果: {summary_result}")
+    application_logger.info("APIから要約を取得しました")
+
+    # PromptUtilsを使用してAPIレスポンスを処理
+    processed_results = PromptUtils.extract_api_responses(
         summary_result,
         error_code_success="",
         error_code_timeout="WRN_02_1_004_006 要約処理システムエラーFlorenceAPI Timeout",
-        error_code_failed="WRN_02_1_004_009 要約処理業務エラーFlorence要約できない"
+        error_code_failed="WRN_02_2_004_009 要約処理業務エラーFlorence要約できない",
     )
-    
-    df["genai_summary_text"] = [result["data"] for result in results]
-    df["error_message"] = [result["error_message"] for result in results]
 
-    # タイムスタンプ追加 / Add timestamp
+    # 結果をDataFrameに追加
+    df["genai_summary_text"] = [result["data"] for result in processed_results]
+    df["error_message"] = [
+        result["error_message"] for result in processed_results
+    ]
+
+    # 空の要約をカウント
+    nan_count = df["genai_summary_text"].isna().sum()
+    blank_count = (df["genai_summary_text"] == "空白").sum()
+
+    if nan_count > 0:
+        application_logger.info(
+            f"要約結果内のNaNは{nan_count}件検出されました"
+        )
+    if blank_count > 0:
+        application_logger.info(
+            f"要約結果内の「空白」文字は{blank_count}件検出されました"
+        )
+
+    # 空の要約を処理
+    df["genai_summary_text"] = df["genai_summary_text"].apply(
+        lambda x: "" if pd.isna(x) or x.strip() == "" or x == "空白" else x
+    )
+
+    # タイムスタンプを追加
     current_utc_time = datetime.now(timezone.utc).isoformat()
     jst_time = from_utc_to_jst(current_utc_time)
     df["genai_summary_run4md"] = jst_time.strftime("%Y-%m-%d %H:%M:%S")
 
-    s3_logger.info("要約生成が完了しました")
-    s3_logger.info("Summary generation completed")
-    
+    application_logger.info("要約生成が完了しました")
     return df
 
 
-@error_handler(
-    "logs/summarization.log", "ERR", "02", "1", "001", "002"
-)
-def save_output_to_s3(df: pd.DataFrame, output_key: str) -> None:
-    """生成された要約結果をS3に保存する。
-    Save generated summary results to S3.
-
-    Args:
-        df: 要約結果を含むDataFrame / DataFrame with summary results
-        output_key: 出力ファイルのS3キー / S3 key of output file
+@error_handler("summarization", "save_output")
+def save_output_to_s3(df, run_date, execution_id, log_path):
     """
-    s3_logger.info(f"結果を {output_key} に保存します")
-    s3_logger.info(f"Saving results to {output_key}")
-    
-    output_df = df[SUMMARIZATION_RESULST_CSV_HEADER]
+    生成された要約結果をS3に保存する
+    """
+    output_key = generate_s3_path(
+        S3_SUMMARIZATION_RESULTS_PATH, run_date, execution_id
+    )
+
+    output_df = df[SUMMARIZATION_RESULTS_CSV_HEADER]
     storage_operator.put_df_to_s3(output_df, output_key)
-    
-    s3_logger.info(f"結果を {output_key} に正常に保存しました")
-    s3_logger.info(f"Successfully saved results to {output_key}")
+
+    application_logger.info(f"結果を {output_key} に正常に保存しました")
+    return output_key
 
 
-@error_handler(
-    "logs/summarization.log", "ERR", "02", "1", "002", "002"
-)
-def write_results_to_db(
-    df: pd.DataFrame, 
-    table_name: str, 
-    schema: str, 
-    index_elements: List[str]
-) -> None:
-    """処理結果をDBに書き込む。
-    Write processing results to DB.
-
-    Args:
-        df: 要約結果を含むDataFrame / DataFrame with summary results
-        table_name: DB表名 / DB table name
-        schema: DBスキーマ名 / DB schema name
-        index_elements: キー列のリスト / List of key columns
+@error_handler("summarization", "write_db")
+def write_results_to_db(log_path, df, table_name, schema, index_elements):
     """
-    s3_logger.info(f"処理結果を{schema}.{table_name}に書き込みます")
-    s3_logger.info(f"Writing processing results to {schema}.{table_name}")
-    
+    処理結果をDBに書き込む
+    """
     records = df.to_dict(orient="records")
     metadata = MetaData()
     table = Table(
-        table_name,
-        metadata,
-        schema=schema,
-        autoload_with=db_operator.engine,
+        table_name, metadata, schema=schema, autoload_with=db_operator.engine
     )
-    
     current_utc_time = datetime.now(timezone.utc).isoformat()
     jst_time = from_utc_to_jst(current_utc_time)
-    current_timestamp = jst_time.strftime("%Y-%m-%d %H:%M:%S")
 
     for record in records:
         set_values = {
             "genai_summary_text": record["genai_summary_text"],
-            "finalupd_tstnp": current_timestamp,
+            "finalupd_tstnp": jst_time.strftime("%Y-%m-%d %H:%M:%S"),
         }
 
         insert_values = {
             "kjoinfo_tsuban": record["kjoinfo_tsuban"],
-            "tourokutstnp": current_timestamp,
+            "tourokutstnp": jst_time.strftime("%Y-%m-%d %H:%M:%S"),
             "trksha_shzkc": "gen-ai",
             "trksha_shzkmei": "gen-ai",
             "tourokushacode": "gen-ai",
@@ -240,126 +222,98 @@ def write_results_to_db(
             update_columns=list(set_values.keys()),
         )
 
-    s3_logger.info("処理結果をDBに正常に書き込みました")
-    s3_logger.info("Successfully wrote processing results to DB")
+    application_logger.info("処理結果をDBに正常に書き込みました")
 
 
-def main() -> None:
-    """メイン関数。
-    Main function.
+def main():
     """
-    # 初期化 / Initialization
+    ECSタスクのメイン関数。要約生成のプロセスを処理する
+    """
     args = init_args()
     execution_id = args.execution_id
     run_date = from_utc_to_jst(args.run_date).strftime("%Y%m%d")
-    
-    # ログパスの生成 / Generate log path
     log_path = (
         S3_LOG_PATH.replace("@run_date", run_date)
         .replace("@execution_id", execution_id)
         .replace("@type", "summarization")
     )
-    
-    # S3パスの生成 / Generate S3 paths
-    input_s3_key = (
-        S3_INPUT_PATH.replace("@run_date", run_date)
-        .replace("@execution_id", execution_id)
-        .replace("@type", "summarization")
-    )
-    
-    result_s3_key = S3_SUMMARIZATION_RESULTS_PATH.replace(
-        "@run_date", run_date
-    ).replace("@execution_id", execution_id)
-    
-    # 共通ユーティリティのインスタンス化 / Instantiate common utilities
+
+    # アプリケーションコンテキストを設定
+    application_logger.set_execution_context("summarization", execution_id)
+
+    # S3ユーティリティの初期化
     s3_utils = S3Utils(storage_operator)
-    
-    # S3から入力CSVファイルを取得 / Get input CSV file from S3
-    input_data = read_csv_from_s3(input_s3_key)
-    
-    # データクリーニング / Data cleaning
-    input_data, missing_data_rows = DataUtils.clean_text_data(input_data, ["mosd_naiyou"])
-    if not missing_data_rows.empty:
-        s3_logger.info(f"{len(missing_data_rows)} 行のデータに欠損値があります")
-        s3_logger.info(f"{len(missing_data_rows)} rows have missing values")
-    
-    # S3から要約プロンプトを取得 / Get summarization prompt from S3
-    s3_logger.info(f"要約プロンプトを取得: {SUMMARIZATION_PROMPT_PATH}")
-    s3_logger.info(f"Retrieving summarization prompt: {SUMMARIZATION_PROMPT_PATH}")
-    
+
+    # CSVデータの読み込み
+    input_data = read_csv_from_s3(
+        run_date, execution_id, "summarization", log_path
+    )
+
+    # プロンプトの取得
     summarization_prompt = s3_prompt.get_prompt(SUMMARIZATION_PROMPT_PATH)
-    
-    # 要約生成 / Generate summaries
-    summary_result_df = generate_summaries(input_data, summarization_prompt)
-    
-    # S3に結果を保存 / Save results to S3
-    save_output_to_s3(summary_result_df, result_s3_key)
-    
-    # DBに結果を書き込み / Write results to DB
+
+    # 要約処理
+    summary_result_df = summarization(
+        input_data, summarization_prompt, log_path
+    )
+
+    # 結果をS3に保存
+    result_s3_key = save_output_to_s3(
+        summary_result_df, run_date, execution_id, log_path
+    )
+
+    # 結果をDBに書き込み
     write_results_to_db(
+        log_path,
         summary_result_df,
         table_name="tblgensummary",
         schema="kujo",
         index_elements=["kjoinfo_tsuban"],
     )
-    
-    # アウトプットファイル存在チェック / Check output file existence
-    s3_logger.info("アウトプットCSVファイル存在チェックを行う")
-    s3_logger.info("Checking output CSV file existence")
-    
+
+    # ファイル存在チェック
+    application_logger.info("出力CSVファイルの存在チェックを実施します")
     s3_utils.check_file_exists(
         key=result_s3_key,
-        log_path=log_path,
-        error_type="ERR",
-        error_main="02",
-        error_category="1",
-        error_module="001",
-        error_detail="001"
+        execution_id=execution_id,
+        module_type="summarization",
+        operation="check_file",
     )
-    
-    # アウトプットファイルヘッダーチェック / Check output file headers
-    s3_logger.info("アウトプットCSVファイルのヘッダーチェックを行う")
-    s3_logger.info("Checking output CSV file headers")
-    
+
+    # ヘッダーチェック
+    application_logger.info("出力CSVファイルのヘッダーチェックを実施します")
     s3_utils.check_file_headers(
         key=result_s3_key,
-        expected_headers=SUMMARIZATION_RESULST_CSV_HEADER,
-        log_path=log_path,
-        error_type="ERR",
-        error_main="02",
-        error_category="1",
-        error_module="001",
-        error_detail="008"
+        expected_headers=SUMMARIZATION_RESULTS_CSV_HEADER,
+        execution_id=execution_id,
+        module_type="summarization",
+        operation="check_header",
     )
-    
-    # 前回実行日時の取得 / Get last run date
+
+    # 前回のendfileを取得
+    application_logger.info("前回のendfileを取得します")
     endfile_s3_key_prefix = S3_ENDFILE_PATH.replace("@type", "summarization")
-    
     last_run_date, last_run_endfile = s3_utils.get_last_run_date(
         endfile_prefix=endfile_s3_key_prefix,
-        log_path=log_path,
-        error_type="ERR",
-        error_main="02",
-        error_category="1",
-        error_module="001",
-        error_detail="001"
+        execution_id=execution_id,
+        module_type="summarization",
+        operation="get_last_run",
     )
-    
-    # endfileの管理（バックアップと新規作成）/ Manage endfile (backup and create new)
+
+    application_logger.info(f"前回のendfileを取得しました: {last_run_endfile}")
+
+    # endfileの管理（バックアップと新規作成）
+    application_logger.info("endfileを更新します")
     s3_utils.manage_endfile(
         endfile_prefix=endfile_s3_key_prefix,
         last_run_endfile=last_run_endfile,
         run_date=args.run_date,
-        log_path=log_path,
-        error_type="ERR",
-        error_main="02",
-        error_category="1",
-        error_module="001",
-        error_detail="002"
+        execution_id=execution_id,
+        module_type="summarization",
+        operation="s3_upload",
     )
-    
-    s3_logger.info("要約処理が完了しました")
-    s3_logger.info("Summarization processing completed")
+
+    application_logger.info("要約処理が正常に完了しました")
 
 
 if __name__ == "__main__":
